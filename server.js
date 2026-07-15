@@ -10,13 +10,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared npm cache ───
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
 
-// ─── State ───
 const projects = new Map();
-const sessions = new Map();   // id → { status, logs, port, process, lastUsed }
+const sessions = new Map();   // id → { status, logs, port, process, outputDir, lastUsed }
 
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -24,7 +22,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── API: create project ───
 app.post('/api/projects', (req, res) => {
   const { files } = req.body;
   if (!files || typeof files !== 'object')
@@ -34,7 +31,6 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Patch vite.config.js ───
 function patchViteConfig(content, id) {
   content = content.replace(/^\s*base:\s*(["'].*?["'])\s*,?\s*$/gm, '');
   content = content.replace(/^\s*server:\s*\{[^}]*\},?\s*$/gm, '');
@@ -47,7 +43,6 @@ function patchViteConfig(content, id) {
   return content;
 }
 
-// ─── Health check for spawned dev servers ───
 function waitForServerReady(port, id, timeoutMs = 20000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -65,20 +60,18 @@ function waitForServerReady(port, id, timeoutMs = 20000) {
   });
 }
 
-// ─── Launch preview ───
 function startDevServer(id) {
   const project = projects.get(id);
   if (!project) return;
   const existing = sessions.get(id);
   if (existing && existing.status === 'running') return;
 
-  const session = { status: 'starting', logs: [], port: null, process: null, lastUsed: Date.now() };
+  const session = { status: 'starting', logs: [], port: null, process: null, outputDir: null, lastUsed: Date.now() };
   sessions.set(id, session);
 
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Patch vite.config.js if present
   const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
   if (viteKey) {
     project.files[viteKey] = patchViteConfig(project.files[viteKey], id);
@@ -95,23 +88,22 @@ function startDevServer(id) {
     if (s) s.logs.push(line);
   };
 
-  // ─── Static site (no package.json) → instant Express static ───
+  // Static site (no package.json) → serve immediately with Express static
   if (!fs.existsSync(path.join(tmpDir, 'package.json'))) {
     log('No package.json – serving static files instantly');
-    app.use(`/preview/${id}`, express.static(tmpDir));
     session.status = 'running';
-    session.port = null;   // no spawned process
+    session.outputDir = tmpDir;   // store for later use
     log('✅ Static preview ready');
     return;
   }
 
-  // ─── Normal npm install flow ───
+  // Normal npm install flow
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
   const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
 
-  install.on('close', async (code) => {
+  install.on('close', (code) => {
     if (code !== 0) {
       session.status = 'error';
       log('npm install failed');
@@ -159,7 +151,6 @@ function startDevServer(id) {
   });
 }
 
-// ─── Cleanup old sessions after 10 min ───
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -172,7 +163,6 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
-// ─── API: start preview ───
 app.get('/api/projects/:id/preview', (req, res) => {
   const id = req.params.id;
   if (!projects.has(id)) return res.status(404).json({ error: 'Project not found' });
@@ -185,40 +175,48 @@ app.get('/api/projects/:id/preview', (req, res) => {
   res.json({ url: `/preview/${id}`, status: 'starting' });
 });
 
-// ─── Logs ───
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
   res.json({ logs: s.logs, status: s.status, url: `/preview/${req.params.id}` });
 });
 
-// ─── Proxy (only if a dev server is running) ───
+// ─── Preview serving middleware (runs BEFORE dashboard static) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  // If static site (no port) or no session, let Express static middleware handle it
-  if (!session || !session.port) return next();
 
-  // Otherwise proxy to dev server
-  const proxyReq = http.request({
-    hostname: '127.0.0.1',
-    port: session.port,
-    path: req.url,
-    method: req.method,
-    headers: { ...req.headers, host: `localhost:${session.port}` }
-  }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
-  proxyReq.on('error', () => res.status(502).send('Preview server unreachable'));
-  req.pipe(proxyReq);
+  // If session exists and is running WITHOUT a port → static site
+  if (session && session.status === 'running' && !session.port && session.outputDir) {
+    // Serve static files directly from the output directory
+    return express.static(session.outputDir)(req, res, next);
+  }
+
+  // If session has a port (dev server) → proxy to it
+  if (session && session.status === 'running' && session.port) {
+    const proxyReq = http.request({
+      hostname: '127.0.0.1',
+      port: session.port,
+      path: req.url,
+      method: req.method,
+      headers: { ...req.headers, host: `localhost:${session.port}` }
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', () => res.status(502).send('Preview server unreachable'));
+    return req.pipe(proxyReq);
+  }
+
+  // Otherwise fall through (loading page or not found)
+  next();
 });
 
-// ─── Loading page ───
+// Loading page for GET /preview/:id (only if not already running)
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (session?.status === 'running') return next();
+  if (session?.status === 'running') return next();  // already handled above
   if (projects.has(id)) {
     if (!session || session.status !== 'starting') startDevServer(id);
     return res.send(`<!DOCTYPE html>
@@ -230,7 +228,7 @@ app.get('/preview/:id', (req, res, next) => {
   next();
 });
 
-// Dashboard
+// Dashboard static files (only if no preview matches)
 const clientDist = path.join(__dirname, 'client', 'dist');
 app.use(express.static(clientDist));
 app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
