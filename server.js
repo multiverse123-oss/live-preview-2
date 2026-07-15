@@ -189,7 +189,7 @@ app.get('/api/projects/:id/preview', (req, res) => {
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
-  res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : `/preview/${req.params.id}`);
+  res.json({ logs: s.logs, status: s.status, url: `/preview/${req.params.id}` });
 });
 
 // ─── Proxy (only if a dev server is running) ───
