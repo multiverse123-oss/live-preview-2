@@ -47,7 +47,7 @@ function patchViteConfig(content, id) {
   return content;
 }
 
-// ─── Health check ───
+// ─── Health check for spawned dev servers ───
 function waitForServerReady(port, id, timeoutMs = 20000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -65,7 +65,7 @@ function waitForServerReady(port, id, timeoutMs = 20000) {
   });
 }
 
-// ─── Launch dev server ───
+// ─── Launch preview ───
 function startDevServer(id) {
   const project = projects.get(id);
   if (!project) return;
@@ -94,46 +94,19 @@ function startDevServer(id) {
     const s = sessions.get(id);
     if (s) s.logs.push(line);
   };
-  const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
 
-  // Check if package.json exists – if not, just serve static files
-  const hasPkg = fs.existsSync(path.join(tmpDir, 'package.json'));
-  if (!hasPkg) {
-    log('No package.json detected – serving static files directly');
-    // Start a static file server (npx serve) immediately
-    const srv = spawn('npx', ['serve', '.', '-l', '0'], { cwd: tmpDir, env, shell: true });
-    session.process = srv;
-
-    let portResolved = false;
-    srv.stdout.on('data', (data) => {
-      const str = data.toString();
-      log(str);
-      if (!portResolved) {
-        const match = str.match(/http:\/\/localhost:(\d+)/);
-        if (match) {
-          const port = parseInt(match[1], 10);
-          portResolved = true;
-          waitForServerReady(port, id)
-            .then(() => {
-              session.port = port;
-              session.status = 'running';
-              log(`✅ Static server healthy on port ${port}`);
-            })
-            .catch(err => {
-              session.status = 'error';
-              log(`❌ Static server failed: ${err.message}`);
-            });
-        }
-      }
-    });
-    srv.stderr.on('data', d => log(d.toString()));
-    srv.on('close', () => {
-      if (!portResolved || session.status !== 'running') session.status = 'error';
-    });
+  // ─── Static site (no package.json) → instant Express static ───
+  if (!fs.existsSync(path.join(tmpDir, 'package.json'))) {
+    log('No package.json – serving static files instantly');
+    app.use(`/preview/${id}`, express.static(tmpDir));
+    session.status = 'running';
+    session.port = null;   // no spawned process
+    log('✅ Static preview ready');
     return;
   }
 
-  // Normal npm install flow
+  // ─── Normal npm install flow ───
+  const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
   const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
@@ -186,7 +159,7 @@ function startDevServer(id) {
   });
 }
 
-// ─── Cleanup after 10 min ───
+// ─── Cleanup old sessions after 10 min ───
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -216,16 +189,17 @@ app.get('/api/projects/:id/preview', (req, res) => {
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
-  res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : null });
+  res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : `/preview/${req.params.id}`);
 });
 
-// ─── Proxy ───
+// ─── Proxy (only if a dev server is running) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (!session || session.status !== 'running' || !session.port) {
-    return res.status(503).send('Preview not ready yet');
-  }
+  // If static site (no port) or no session, let Express static middleware handle it
+  if (!session || !session.port) return next();
+
+  // Otherwise proxy to dev server
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: session.port,
