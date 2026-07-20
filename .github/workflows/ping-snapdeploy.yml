@@ -1,0 +1,15 @@
+name: Keep SnapDeploy alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping SnapDeploy engine
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://live-preview-af768.containers.snapdeploy.app/ || echo "fail")
+          echo "SnapDeploy status: $STATUS"
