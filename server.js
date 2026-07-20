@@ -8,19 +8,37 @@ const http = require('http');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '50mb' }));  // allow large base64 payloads
 
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
 
 const projects = new Map();
-const sessions = new Map();   // id → { status, logs, port, process, outputDir, lastUsed }
+const sessions = new Map();
 
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   next();
 });
+
+// ─── Helper: guess if a file is binary based on extension ───
+const BINARY_EXTS = ['.png','.jpg','.jpeg','.gif','.webp','.mp4','.webm','.ogg','.woff','.woff2','.ttf','.eot','.ico','.svg','.pdf'];
+
+function isBinaryExtension(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return BINARY_EXTS.includes(ext);
+}
+
+function writeFileSmart(filePath, content) {
+  if (isBinaryExtension(filePath)) {
+    // Assume content is a base64 string without the data URI prefix
+    const buffer = Buffer.from(content, 'base64');
+    fs.writeFileSync(filePath, buffer);
+  } else {
+    fs.writeFileSync(filePath, content, 'utf8');
+  }
+}
 
 app.post('/api/projects', (req, res) => {
   const { files } = req.body;
@@ -77,10 +95,11 @@ function startDevServer(id) {
     project.files[viteKey] = patchViteConfig(project.files[viteKey], id);
   }
 
+  // Write all files (text or binary)
   Object.entries(project.files).forEach(([f, c]) => {
     const fp = path.join(tmpDir, f);
     fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, c, 'utf8');
+    writeFileSmart(fp, c);
   });
 
   const log = (line) => {
@@ -88,16 +107,16 @@ function startDevServer(id) {
     if (s) s.logs.push(line);
   };
 
-  // Static site (no package.json) → serve immediately with Express static
+  // Static site (no package.json)
   if (!fs.existsSync(path.join(tmpDir, 'package.json'))) {
     log('No package.json – serving static files instantly');
     session.status = 'running';
-    session.outputDir = tmpDir;   // store for later use
+    session.outputDir = tmpDir;
     log('✅ Static preview ready');
     return;
   }
 
-  // Normal npm install flow
+  // npm install
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
   const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
@@ -181,18 +200,16 @@ app.get('/api/projects/:id/logs', (req, res) => {
   res.json({ logs: s.logs, status: s.status, url: `/preview/${req.params.id}` });
 });
 
-// ─── Preview serving middleware (runs BEFORE dashboard static) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
 
-  // If session exists and is running WITHOUT a port → static site
+  // static site (no port, outputDir)
   if (session && session.status === 'running' && !session.port && session.outputDir) {
-    // Serve static files directly from the output directory
     return express.static(session.outputDir)(req, res, next);
   }
 
-  // If session has a port (dev server) → proxy to it
+  // dev server proxy
   if (session && session.status === 'running' && session.port) {
     const proxyReq = http.request({
       hostname: '127.0.0.1',
@@ -208,15 +225,13 @@ app.use('/preview/:id', (req, res, next) => {
     return req.pipe(proxyReq);
   }
 
-  // Otherwise fall through (loading page or not found)
   next();
 });
 
-// Loading page for GET /preview/:id (only if not already running)
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (session?.status === 'running') return next();  // already handled above
+  if (session?.status === 'running') return next();
   if (projects.has(id)) {
     if (!session || session.status !== 'starting') startDevServer(id);
     return res.send(`<!DOCTYPE html>
@@ -228,7 +243,6 @@ app.get('/preview/:id', (req, res, next) => {
   next();
 });
 
-// Dashboard static files (only if no preview matches)
 const clientDist = path.join(__dirname, 'client', 'dist');
 app.use(express.static(clientDist));
 app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
