@@ -1,0 +1,11 @@
+name: Keep new primary alive
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping new Render URL
+        run: curl -sS -o /dev/null -w "%{http_code}" https://live-preview-2-13az.onrender.com/
