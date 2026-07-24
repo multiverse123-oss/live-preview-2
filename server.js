@@ -30,33 +30,55 @@ app.use((req, res, next) => {
 
 const BINARY_EXTS = ['.png','.jpg','.jpeg','.gif','.webp','.mp4','.webm','.ogg','.woff','.woff2','.ttf','.eot','.ico','.svg','.pdf'];
 
-function isBinaryExtension(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  return BINARY_EXTS.includes(ext);
+function isBinaryExtension(fp) {
+  return BINARY_EXTS.includes(path.extname(fp).toLowerCase());
 }
 
-function writeFileSmart(filePath, content) {
-  if (isBinaryExtension(filePath)) {
-    const buffer = Buffer.from(content, 'base64');
-    fs.writeFileSync(filePath, buffer);
+function writeFileSmart(fp, content) {
+  if (isBinaryExtension(fp)) {
+    fs.writeFileSync(fp, Buffer.from(content, 'base64'));
   } else {
-    fs.writeFileSync(filePath, content, 'utf8');
+    fs.writeFileSync(fp, content, 'utf8');
   }
 }
 
-// ─── Detect frontend root by finding the first directory that contains package.json ───
+// ─── Find the frontend directory we should actually run ───
+const FRONTEND_DIRS = ['frontend', 'client', 'web', 'src'];
+
 function detectFrontendRoot(baseDir) {
-  // Check root first
-  if (fs.existsSync(path.join(baseDir, 'package.json'))) return baseDir;
-  // Check immediate subdirectories (e.g., 'frontend', 'client')
+  // 1. Check if baseDir itself has a package.json
+  const rootPkg = path.join(baseDir, 'package.json');
+  if (fs.existsSync(rootPkg)) {
+    // Look for a subdirectory that is clearly the frontend
+    for (const dir of FRONTEND_DIRS) {
+      const subDir = path.join(baseDir, dir);
+      if (fs.existsSync(path.join(subDir, 'package.json'))) {
+        return subDir;   // e.g., nexus/frontend
+      }
+    }
+    // No recognised frontend subdir – just use baseDir
+    return baseDir;
+  }
+
+  // 2. No root package.json – scan immediate children
   const entries = fs.readdirSync(baseDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const subPath = path.join(baseDir, entry.name);
-      if (fs.existsSync(path.join(subPath, 'package.json'))) return subPath;
+      const subDir = path.join(baseDir, entry.name);
+      if (fs.existsSync(path.join(subDir, 'package.json'))) {
+        // Found a project root, now check for a frontend inside it
+        for (const dir of FRONTEND_DIRS) {
+          const innerFront = path.join(subDir, dir);
+          if (fs.existsSync(path.join(innerFront, 'package.json'))) {
+            return innerFront;   // e.g., nexus/frontend when nexus/ has its own package.json
+          }
+        }
+        // No frontend subdir – use the project root
+        return subDir;
+      }
     }
   }
-  // If nothing found, fallback to baseDir
+  // Give up – serve everything as static
   return baseDir;
 }
 
@@ -126,13 +148,10 @@ function startDevServer(id) {
     if (s) s.logs.push(line);
   };
 
-  // Detect the frontend root (where package.json lives)
   const frontendRoot = detectFrontendRoot(tmpDir);
-  if (frontendRoot !== tmpDir) {
-    log(`Detected frontend root: ${path.relative(tmpDir, frontendRoot)}`);
-  }
+  const relPath = path.relative(tmpDir, frontendRoot) || '.';
+  log(`Frontend root: ${relPath}`);
 
-  // Static site check (no package.json in the frontend root)
   if (!fs.existsSync(path.join(frontendRoot, 'package.json'))) {
     log('No package.json – serving static files instantly');
     session.status = 'running';
@@ -141,7 +160,6 @@ function startDevServer(id) {
     return;
   }
 
-  // Run npm install in the frontend root
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
   const install = spawn('npm', ['install'], { cwd: frontendRoot, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
