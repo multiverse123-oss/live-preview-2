@@ -7,8 +7,14 @@ const fs = require('fs');
 const http = require('http');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));  // allow large base64 payloads
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false
+}));
+app.options('*', cors());
+app.use(express.json({ limit: '50mb' }));
 
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
@@ -22,7 +28,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Helper: guess if a file is binary based on extension ───
 const BINARY_EXTS = ['.png','.jpg','.jpeg','.gif','.webp','.mp4','.webm','.ogg','.woff','.woff2','.ttf','.eot','.ico','.svg','.pdf'];
 
 function isBinaryExtension(filePath) {
@@ -32,12 +37,27 @@ function isBinaryExtension(filePath) {
 
 function writeFileSmart(filePath, content) {
   if (isBinaryExtension(filePath)) {
-    // Assume content is a base64 string without the data URI prefix
     const buffer = Buffer.from(content, 'base64');
     fs.writeFileSync(filePath, buffer);
   } else {
     fs.writeFileSync(filePath, content, 'utf8');
   }
+}
+
+// ─── Detect frontend root by finding the first directory that contains package.json ───
+function detectFrontendRoot(baseDir) {
+  // Check root first
+  if (fs.existsSync(path.join(baseDir, 'package.json'))) return baseDir;
+  // Check immediate subdirectories (e.g., 'frontend', 'client')
+  const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const subPath = path.join(baseDir, entry.name);
+      if (fs.existsSync(path.join(subPath, 'package.json'))) return subPath;
+    }
+  }
+  // If nothing found, fallback to baseDir
+  return baseDir;
 }
 
 app.post('/api/projects', (req, res) => {
@@ -95,7 +115,6 @@ function startDevServer(id) {
     project.files[viteKey] = patchViteConfig(project.files[viteKey], id);
   }
 
-  // Write all files (text or binary)
   Object.entries(project.files).forEach(([f, c]) => {
     const fp = path.join(tmpDir, f);
     fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -107,18 +126,24 @@ function startDevServer(id) {
     if (s) s.logs.push(line);
   };
 
-  // Static site (no package.json)
-  if (!fs.existsSync(path.join(tmpDir, 'package.json'))) {
+  // Detect the frontend root (where package.json lives)
+  const frontendRoot = detectFrontendRoot(tmpDir);
+  if (frontendRoot !== tmpDir) {
+    log(`Detected frontend root: ${path.relative(tmpDir, frontendRoot)}`);
+  }
+
+  // Static site check (no package.json in the frontend root)
+  if (!fs.existsSync(path.join(frontendRoot, 'package.json'))) {
     log('No package.json – serving static files instantly');
     session.status = 'running';
-    session.outputDir = tmpDir;
+    session.outputDir = frontendRoot;
     log('✅ Static preview ready');
     return;
   }
 
-  // npm install
+  // Run npm install in the frontend root
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
-  const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
+  const install = spawn('npm', ['install'], { cwd: frontendRoot, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
 
@@ -130,14 +155,14 @@ function startDevServer(id) {
     }
     log('Install complete – starting dev server...');
 
-    const pkgPath = path.join(tmpDir, 'package.json');
+    const pkgPath = path.join(frontendRoot, 'package.json');
     let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
     if (fs.existsSync(pkgPath)) {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
       if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
     }
 
-    const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: tmpDir, env, shell: true });
+    const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: frontendRoot, env, shell: true });
     session.process = dev;
 
     let portResolved = false;
@@ -204,12 +229,10 @@ app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
 
-  // static site (no port, outputDir)
   if (session && session.status === 'running' && !session.port && session.outputDir) {
     return express.static(session.outputDir)(req, res, next);
   }
 
-  // dev server proxy
   if (session && session.status === 'running' && session.port) {
     const proxyReq = http.request({
       hostname: '127.0.0.1',
