@@ -42,43 +42,35 @@ function writeFileSmart(fp, content) {
   }
 }
 
-// ─── Find the frontend directory we should actually run ───
 const FRONTEND_DIRS = ['frontend', 'client', 'web', 'src'];
 
 function detectFrontendRoot(baseDir) {
-  // 1. Check if baseDir itself has a package.json
   const rootPkg = path.join(baseDir, 'package.json');
   if (fs.existsSync(rootPkg)) {
-    // Look for a subdirectory that is clearly the frontend
     for (const dir of FRONTEND_DIRS) {
       const subDir = path.join(baseDir, dir);
       if (fs.existsSync(path.join(subDir, 'package.json'))) {
-        return subDir;   // e.g., nexus/frontend
+        return subDir;
       }
     }
-    // No recognised frontend subdir – just use baseDir
     return baseDir;
   }
 
-  // 2. No root package.json – scan immediate children
   const entries = fs.readdirSync(baseDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
       const subDir = path.join(baseDir, entry.name);
       if (fs.existsSync(path.join(subDir, 'package.json'))) {
-        // Found a project root, now check for a frontend inside it
         for (const dir of FRONTEND_DIRS) {
           const innerFront = path.join(subDir, dir);
           if (fs.existsSync(path.join(innerFront, 'package.json'))) {
-            return innerFront;   // e.g., nexus/frontend when nexus/ has its own package.json
+            return innerFront;
           }
         }
-        // No frontend subdir – use the project root
         return subDir;
       }
     }
   }
-  // Give up – serve everything as static
   return baseDir;
 }
 
@@ -174,10 +166,13 @@ function startDevServer(id) {
     log('Install complete – starting dev server...');
 
     const pkgPath = path.join(frontendRoot, 'package.json');
-    let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
+    // Build command with base flag
+    let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
     if (fs.existsSync(pkgPath)) {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
+      if (!pkg.scripts?.dev) {
+        startCmd = ['npx', 'serve', '.', '-l', '0'];
+      }
     }
 
     const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: frontendRoot, env, shell: true });
