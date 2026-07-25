@@ -95,7 +95,7 @@ function patchViteConfig(content, id) {
   return content;
 }
 
-function waitForServerReady(port, id, timeoutMs = 20000) {
+function waitForServerReady(port, id, timeoutMs = 30000) {   // increased timeout
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
@@ -144,6 +144,7 @@ function startDevServer(id) {
   const relPath = path.relative(tmpDir, frontendRoot) || '.';
   log(`Frontend root: ${relPath}`);
 
+  // Verify package.json exists
   if (!fs.existsSync(path.join(frontendRoot, 'package.json'))) {
     log('No package.json – serving static files instantly');
     session.status = 'running';
@@ -152,21 +153,27 @@ function startDevServer(id) {
     return;
   }
 
+  log('Installing dependencies...');
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
-  const install = spawn('npm', ['install'], { cwd: frontendRoot, env, shell: true });
+  const install = spawn('npm', ['install', '--prefer-offline'], { cwd: frontendRoot, env, shell: true });
+
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
 
+  install.on('error', (err) => {
+    log(`Install error: ${err.message}`);
+    session.status = 'error';
+  });
+
   install.on('close', (code) => {
     if (code !== 0) {
+      log(`npm install failed with code ${code}`);
       session.status = 'error';
-      log('npm install failed');
       return;
     }
     log('Install complete – starting dev server...');
 
     const pkgPath = path.join(frontendRoot, 'package.json');
-    // Build command with base flag
     let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
     if (fs.existsSync(pkgPath)) {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
@@ -201,6 +208,10 @@ function startDevServer(id) {
       }
     });
     dev.stderr.on('data', d => log(d.toString()));
+    dev.on('error', (err) => {
+      log(`Dev server error: ${err.message}`);
+      session.status = 'error';
+    });
     dev.on('close', () => {
       if (!portResolved || session.status !== 'running') session.status = 'error';
       else session.status = 'stopped';
