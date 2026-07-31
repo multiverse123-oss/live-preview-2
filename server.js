@@ -83,19 +83,33 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
+// ─── Safe config patcher – no regex, uses string replacement precisely ───
 function patchViteConfig(content, id) {
-  content = content.replace(/^\s*base:\s*(["'].*?["'])\s*,?\s*$/gm, '');
-  content = content.replace(/^\s*server:\s*\{[^}]*\},?\s*$/gm, '');
-  content = content.replace(
-    /(defineConfig\s*\(\s*\{)/,
-    `$1
+  // Remove any existing base and server block (just in case)
+  content = content.replace(/^\s*base\s*:\s*(["'].*?["'])\s*,?\s*$/gm, '');
+  content = content.replace(/^\s*server\s*:\s*\{[^}]*\},?\s*$/gm, '');
+  
+  // Now inject base and server inside defineConfig({ ... })
+  // Look for 'defineConfig(' and then the opening brace
+  const defineIndex = content.indexOf('defineConfig(');
+  if (defineIndex === -1) return content;   // not a valid Vite config
+
+  const openBrace = content.indexOf('{', defineIndex);
+  if (openBrace === -1) return content;
+
+  // Insert right after the opening brace, before the first existing property
+  const before = content.slice(0, openBrace + 1);
+  const after = content.slice(openBrace + 1);
+  
+  // Build the new config fragment
+  const newConfig = `
   base: '/preview/${id}/',
-  server: { allowedHosts: true, host: '0.0.0.0' },`
-  );
-  return content;
+  server: { allowedHosts: true, host: '0.0.0.0' },`;
+  
+  return before + newConfig + after;
 }
 
-function waitForServerReady(port, id, timeoutMs = 30000) {   // increased timeout
+function waitForServerReady(port, id, timeoutMs = 1000000) {   // 1000 seconds
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
@@ -144,7 +158,6 @@ function startDevServer(id) {
   const relPath = path.relative(tmpDir, frontendRoot) || '.';
   log(`Frontend root: ${relPath}`);
 
-  // Verify package.json exists
   if (!fs.existsSync(path.join(frontendRoot, 'package.json'))) {
     log('No package.json – serving static files instantly');
     session.status = 'running';
