@@ -47,6 +47,12 @@ const FRONTEND_DIRS = ['frontend', 'client', 'web', 'src'];
 function detectFrontendRoot(baseDir) {
   const rootPkg = path.join(baseDir, 'package.json');
   if (fs.existsSync(rootPkg)) {
+    // Check if root itself contains vite config – if yes, root is the frontend
+    if (fs.existsSync(path.join(baseDir, 'vite.config.js')) ||
+        fs.existsSync(path.join(baseDir, 'vite.config.ts'))) {
+      return baseDir;
+    }
+    // Otherwise look inside common frontend subdirs
     for (const dir of FRONTEND_DIRS) {
       const subDir = path.join(baseDir, dir);
       if (fs.existsSync(path.join(subDir, 'package.json'))) {
@@ -56,11 +62,17 @@ function detectFrontendRoot(baseDir) {
     return baseDir;
   }
 
+  // No root package.json – scan subdirectories
   const entries = fs.readdirSync(baseDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
       const subDir = path.join(baseDir, entry.name);
       if (fs.existsSync(path.join(subDir, 'package.json'))) {
+        // Check if subdir has vite config
+        if (fs.existsSync(path.join(subDir, 'vite.config.js')) ||
+            fs.existsSync(path.join(subDir, 'vite.config.ts'))) {
+          return subDir;
+        }
         for (const dir of FRONTEND_DIRS) {
           const innerFront = path.join(subDir, dir);
           if (fs.existsSync(path.join(innerFront, 'package.json'))) {
@@ -85,23 +97,18 @@ app.post('/api/projects', (req, res) => {
 
 // ─── Safe config patcher – no regex, uses string replacement precisely ───
 function patchViteConfig(content, id) {
-  // Remove any existing base and server block (just in case)
   content = content.replace(/^\s*base\s*:\s*(["'].*?["'])\s*,?\s*$/gm, '');
   content = content.replace(/^\s*server\s*:\s*\{[^}]*\},?\s*$/gm, '');
   
-  // Now inject base and server inside defineConfig({ ... })
-  // Look for 'defineConfig(' and then the opening brace
   const defineIndex = content.indexOf('defineConfig(');
-  if (defineIndex === -1) return content;   // not a valid Vite config
+  if (defineIndex === -1) return content;
 
   const openBrace = content.indexOf('{', defineIndex);
   if (openBrace === -1) return content;
 
-  // Insert right after the opening brace, before the first existing property
   const before = content.slice(0, openBrace + 1);
   const after = content.slice(openBrace + 1);
   
-  // Build the new config fragment
   const newConfig = `
   base: '/preview/${id}/',
   server: { allowedHosts: true, host: '0.0.0.0' },`;
@@ -109,7 +116,7 @@ function patchViteConfig(content, id) {
   return before + newConfig + after;
 }
 
-function waitForServerReady(port, id, timeoutMs = 1000000) {   // 1000 seconds
+function waitForServerReady(port, id, timeoutMs = 1000000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
@@ -186,11 +193,20 @@ function startDevServer(id) {
     }
     log('Install complete – starting dev server...');
 
-    const pkgPath = path.join(frontendRoot, 'package.json');
-    let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
-    if (fs.existsSync(pkgPath)) {
+    // Check if frontend is a Vite project – if so, run Vite directly (ignore backend)
+    const hasViteConfig = fs.existsSync(path.join(frontendRoot, 'vite.config.js')) ||
+                          fs.existsSync(path.join(frontendRoot, 'vite.config.ts'));
+    let startCmd;
+    if (hasViteConfig) {
+      // Direct Vite: only frontend, correct base/port
+      log('Detected Vite frontend – starting directly');
+      startCmd = ['npx', 'vite', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
+    } else {
+      const pkgPath = path.join(frontendRoot, 'package.json');
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (!pkg.scripts?.dev) {
+      if (pkg.scripts?.dev) {
+        startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
+      } else {
         startCmd = ['npx', 'serve', '.', '-l', '0'];
       }
     }
