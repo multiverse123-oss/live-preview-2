@@ -7,20 +7,31 @@ const fs = require('fs');
 const http = require('http');
 
 const app = express();
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  credentials: false
-}));
-app.options('*', cors());
-app.use(express.json({ limit: '50mb' }));
-
+const PORT = Number(process.env.PORT || 3000);
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
-fs.mkdirSync(NPM_CACHE, { recursive: true });
-
+const BUILDS_DIR = path.join(__dirname, 'builds');
 const projects = new Map();
 const sessions = new Map();
+const FRONTEND_DIRS = ['frontend', 'client', 'web', 'src'];
+const BINARY_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.webm',
+  '.woff', '.woff2', '.ttf', '.ico', '.svg', '.pdf'
+]);
+const HEALTH_CHECK_TIMEOUT_MS = 1000 * 1000;
+
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+};
+
+fs.mkdirSync(NPM_CACHE, { recursive: true });
+fs.mkdirSync(BUILDS_DIR, { recursive: true });
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '50mb' }));
 
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -28,300 +39,582 @@ app.use((req, res, next) => {
   next();
 });
 
-const BINARY_EXTS = ['.png','.jpg','.jpeg','.gif','.webp','.mp4','.webm','.ogg','.woff','.woff2','.ttf','.eot','.ico','.svg','.pdf'];
-
-function isBinaryExtension(fp) {
-  return BINARY_EXTS.includes(path.extname(fp).toLowerCase());
+function timestamp() {
+  return new Date().toISOString();
 }
 
-function writeFileSmart(fp, content) {
-  if (isBinaryExtension(fp)) {
-    fs.writeFileSync(fp, Buffer.from(content, 'base64'));
-  } else {
-    fs.writeFileSync(fp, content, 'utf8');
+function logLine(session, message) {
+  if (!session) return;
+  const text = String(message);
+  const lines = text.split(/\r\n|\n|\r/);
+  for (const line of lines) {
+    if (line.length > 0) {
+      session.logs.push(`[${timestamp()}] ${line}`);
+    }
   }
 }
 
-const FRONTEND_DIRS = ['frontend', 'client', 'web', 'src'];
+function logServer(message) {
+  console.log(`[${timestamp()}] ${message}`);
+}
+
+function isBinaryExtension(filePath) {
+  return BINARY_EXTS.has(path.extname(filePath).toLowerCase());
+}
+
+function writeFileSmart(filePath, content) {
+  if (typeof content !== 'string') {
+    throw new Error(`File content must be a string: ${filePath}`);
+  }
+  if (isBinaryExtension(filePath)) {
+    fs.writeFileSync(filePath, Buffer.from(content, 'base64'));
+  } else {
+    fs.writeFileSync(filePath, content, 'utf8');
+  }
+}
+
+function resolveProjectFile(baseDir, fileName) {
+  if (typeof fileName !== 'string' || fileName.includes('\0')) {
+    throw new Error('Invalid project file path');
+  }
+
+  const normalizedName = fileName.replace(/\\/g, '/');
+  const resolved = path.resolve(baseDir, normalizedName);
+  const relative = path.relative(baseDir, resolved);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Project file escapes its build directory: ${fileName}`);
+  }
+  return resolved;
+}
+
+function hasViteConfig(directory) {
+  return fs.existsSync(path.join(directory, 'vite.config.js')) ||
+    fs.existsSync(path.join(directory, 'vite.config.ts'));
+}
+
+function readPackage(directory) {
+  const packagePath = path.join(directory, 'package.json');
+  if (!fs.existsSync(packagePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Invalid package.json in ${directory}: ${error.message}`);
+  }
+}
+
+function hasAnyPackageJson(directory) {
+  const entries = fs.readdirSync(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isFile() && entry.name === 'package.json') return true;
+    if (entry.isDirectory() && hasAnyPackageJson(entryPath)) return true;
+  }
+  return false;
+}
+
+function isConcurrentlyScript(script) {
+  return typeof script === 'string' && script.toLowerCase().includes('concurrently');
+}
 
 function detectFrontendRoot(baseDir) {
-  const rootPkg = path.join(baseDir, 'package.json');
-  if (fs.existsSync(rootPkg)) {
-    // Check if root itself contains vite config – if yes, root is the frontend
-    if (fs.existsSync(path.join(baseDir, 'vite.config.js')) ||
-        fs.existsSync(path.join(baseDir, 'vite.config.ts'))) {
-      return baseDir;
-    }
-    // Otherwise look inside common frontend subdirs
-    for (const dir of FRONTEND_DIRS) {
-      const subDir = path.join(baseDir, dir);
-      if (fs.existsSync(path.join(subDir, 'package.json'))) {
-        return subDir;
-      }
-    }
-    return baseDir;
+  if (hasViteConfig(baseDir)) {
+    return { directory: baseDir, reason: 'root Vite config' };
   }
 
-  // No root package.json – scan subdirectories
-  const entries = fs.readdirSync(baseDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      const subDir = path.join(baseDir, entry.name);
-      if (fs.existsSync(path.join(subDir, 'package.json'))) {
-        // Check if subdir has vite config
-        if (fs.existsSync(path.join(subDir, 'vite.config.js')) ||
-            fs.existsSync(path.join(subDir, 'vite.config.ts'))) {
-          return subDir;
-        }
-        for (const dir of FRONTEND_DIRS) {
-          const innerFront = path.join(subDir, dir);
-          if (fs.existsSync(path.join(innerFront, 'package.json'))) {
-            return innerFront;
-          }
-        }
-        return subDir;
-      }
+  for (const name of FRONTEND_DIRS) {
+    const directory = path.join(baseDir, name);
+    if (fs.existsSync(directory) && hasViteConfig(directory)) {
+      return { directory, reason: `${name}/ Vite config` };
     }
   }
-  return baseDir;
+
+  const immediateDirectories = fs.readdirSync(baseDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== '.git')
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of immediateDirectories) {
+    const directory = path.join(baseDir, entry.name);
+    if (hasViteConfig(directory)) {
+      return { directory, reason: `immediate ${entry.name}/ Vite config` };
+    }
+  }
+
+  for (const name of FRONTEND_DIRS) {
+    const directory = path.join(baseDir, name);
+    if (readPackage(directory)) {
+      return { directory, reason: `${name}/ package.json` };
+    }
+  }
+
+  const rootPackage = readPackage(baseDir);
+  if (rootPackage) {
+    if (isConcurrentlyScript(rootPackage.scripts?.dev)) {
+      return null;
+    }
+    return { directory: baseDir, reason: 'root package.json' };
+  }
+
+  if (!hasAnyPackageJson(baseDir)) {
+    return { directory: baseDir, reason: 'static project with no package.json' };
+  }
+
+  for (const entry of immediateDirectories) {
+    const directory = path.join(baseDir, entry.name);
+    if (readPackage(directory)) {
+      return { directory, reason: `immediate ${entry.name}/ package.json` };
+    }
+  }
+
+  return { directory: baseDir, reason: 'project root fallback' };
 }
 
-app.post('/api/projects', (req, res) => {
-  const { files } = req.body;
-  if (!files || typeof files !== 'object')
-    return res.status(400).json({ error: 'Missing files object' });
-  const id = uuidv4();
-  projects.set(id, { files, createdAt: Date.now() });
-  res.json({ id });
-});
+function findMatchingBrace(content, openBrace) {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
 
-// ─── Safe config patcher – no regex, uses string replacement precisely ───
+  for (let index = openBrace; index < content.length; index += 1) {
+    const character = content[index];
+    const next = content[index + 1];
+
+    if (lineComment) {
+      if (character === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '{') {
+      depth += 1;
+    } else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+
+  return -1;
+}
+
 function patchViteConfig(content, id) {
-  content = content.replace(/^\s*base\s*:\s*(["'].*?["'])\s*,?\s*$/gm, '');
-  content = content.replace(/^\s*server\s*:\s*\{[^}]*\},?\s*$/gm, '');
-  
+  if (typeof content !== 'string') {
+    throw new Error('Vite config must be text');
+  }
+
   const defineIndex = content.indexOf('defineConfig(');
-  if (defineIndex === -1) return content;
+  if (defineIndex === -1) {
+    return content;
+  }
 
   const openBrace = content.indexOf('{', defineIndex);
-  if (openBrace === -1) return content;
+  if (openBrace === -1) {
+    return content;
+  }
 
-  const before = content.slice(0, openBrace + 1);
-  const after = content.slice(openBrace + 1);
-  
-  const newConfig = `
-  base: '/preview/${id}/',
-  server: { allowedHosts: true, host: '0.0.0.0' },`;
-  
-  return before + newConfig + after;
+  const closeBrace = findMatchingBrace(content, openBrace);
+  if (closeBrace === -1) {
+    throw new Error('Could not find the end of the Vite config object');
+  }
+
+  const injectedConfig = [
+    '',
+    `  base: '/preview/${id}/',`,
+    `  server: { allowedHosts: true, host: '0.0.0.0' },`,
+    ''
+  ].join('\n');
+
+  // Insert at the end of the config object so existing base/server fields
+  // cannot override the proxy-safe values. This intentionally uses indexes,
+  // not a regex that could corrupt nested JavaScript.
+  return content.slice(0, closeBrace) + injectedConfig + content.slice(closeBrace);
 }
 
-function waitForServerReady(port, id, timeoutMs = 1000000) {
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const check = () => {
-      if (Date.now() - start > timeoutMs) return reject(new Error('Health check timeout'));
-      http.get(`http://127.0.0.1:${port}/preview/${id}/`, (res) => {
-        if (res.statusCode === 200 && (res.headers['content-type'] || '').includes('text/html')) {
-          resolve();
-        } else {
-          setTimeout(check, 500);
-        }
-      }).on('error', () => setTimeout(check, 500));
-    };
-    check();
+function readViteConfig(directory) {
+  for (const fileName of ['vite.config.js', 'vite.config.ts']) {
+    const filePath = path.join(directory, fileName);
+    if (fs.existsSync(filePath)) {
+      return { fileName, filePath };
+    }
+  }
+  return null;
+}
+
+function isViteProject(directory, packageJson) {
+  if (readViteConfig(directory)) return true;
+  const scripts = packageJson?.scripts || {};
+  const dependencies = {
+    ...(packageJson?.dependencies || {}),
+    ...(packageJson?.devDependencies || {})
+  };
+  return Boolean(dependencies.vite) || /\bvite\b/i.test(scripts.dev || '');
+}
+
+function detectPort(output) {
+  const matches = [
+    output.match(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i),
+    output.match(/\bport\s+(\d{2,5})\b/i)
+  ];
+  for (const match of matches) {
+    if (match && Number(match[1]) > 0) return Number(match[1]);
+  }
+  return null;
+}
+
+function requestHealth(port, requestPath) {
+  return new Promise((resolve) => {
+    const request = http.get({
+      hostname: '127.0.0.1',
+      port,
+      path: requestPath,
+      timeout: 5000,
+      headers: { Host: `localhost:${port}` }
+    }, (response) => {
+      const contentType = response.headers['content-type'] || '';
+      const healthy = response.statusCode >= 200 &&
+        response.statusCode < 400 &&
+        contentType.includes('text/html');
+      response.resume();
+      resolve(healthy);
+    });
+    request.on('timeout', () => request.destroy());
+    request.on('error', () => resolve(false));
   });
+}
+
+async function waitForServerReady(port, id, timeoutMs = HEALTH_CHECK_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  const paths = [`/preview/${id}/`, '/'];
+  while (Date.now() - startedAt <= timeoutMs) {
+    for (const requestPath of paths) {
+      if (await requestHealth(port, requestPath)) return requestPath;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Health check timeout after ${timeoutMs / 1000} seconds`);
+}
+
+function setSessionError(session, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  logLine(session, `ERROR: ${message}`);
+  session.status = 'error';
+}
+
+function spawnCommand(session, command, args, options) {
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    shell: false
+  });
+  session.process = child;
+  logLine(session, `Spawned ${command} ${args.join(' ')}`);
+  return child;
 }
 
 function startDevServer(id) {
   const project = projects.get(id);
-  if (!project) return;
+  if (!project) return null;
+
   const existing = sessions.get(id);
-  if (existing && existing.status === 'running') return;
-
-  const session = { status: 'starting', logs: [], port: null, process: null, outputDir: null, lastUsed: Date.now() };
-  sessions.set(id, session);
-
-  const tmpDir = path.join(__dirname, 'builds', id);
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
-  if (viteKey) {
-    project.files[viteKey] = patchViteConfig(project.files[viteKey], id);
+  if (existing && (existing.status === 'starting' || existing.status === 'running')) {
+    existing.lastUsed = Date.now();
+    return existing;
   }
 
-  Object.entries(project.files).forEach(([f, c]) => {
-    const fp = path.join(tmpDir, f);
-    fs.mkdirSync(path.dirname(fp), { recursive: true });
-    writeFileSmart(fp, c);
-  });
-
-  const log = (line) => {
-    const s = sessions.get(id);
-    if (s) s.logs.push(line);
+  const session = {
+    status: 'starting',
+    logs: [],
+    port: null,
+    process: null,
+    installProcess: null,
+    outputDir: null,
+    lastUsed: Date.now()
   };
+  sessions.set(id, session);
+  logLine(session, 'Preview setup started');
 
-  const frontendRoot = detectFrontendRoot(tmpDir);
-  const relPath = path.relative(tmpDir, frontendRoot) || '.';
-  log(`Frontend root: ${relPath}`);
+  setImmediate(() => {
+    try {
+      const tmpDir = path.join(BUILDS_DIR, id);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.mkdirSync(tmpDir, { recursive: true });
 
-  if (!fs.existsSync(path.join(frontendRoot, 'package.json'))) {
-    log('No package.json – serving static files instantly');
-    session.status = 'running';
-    session.outputDir = frontendRoot;
-    log('✅ Static preview ready');
-    return;
-  }
-
-  log('Installing dependencies...');
-  const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
-  const install = spawn('npm', ['install', '--prefer-offline'], { cwd: frontendRoot, env, shell: true });
-
-  install.stdout.on('data', d => log(d.toString()));
-  install.stderr.on('data', d => log(d.toString()));
-
-  install.on('error', (err) => {
-    log(`Install error: ${err.message}`);
-    session.status = 'error';
-  });
-
-  install.on('close', (code) => {
-    if (code !== 0) {
-      log(`npm install failed with code ${code}`);
-      session.status = 'error';
-      return;
-    }
-    log('Install complete – starting dev server...');
-
-    // Check if frontend is a Vite project – if so, run Vite directly (ignore backend)
-    const hasViteConfig = fs.existsSync(path.join(frontendRoot, 'vite.config.js')) ||
-                          fs.existsSync(path.join(frontendRoot, 'vite.config.ts'));
-    let startCmd;
-    if (hasViteConfig) {
-      // Direct Vite: only frontend, correct base/port
-      log('Detected Vite frontend – starting directly');
-      startCmd = ['npx', 'vite', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
-    } else {
-      const pkgPath = path.join(frontendRoot, 'package.json');
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (pkg.scripts?.dev) {
-        startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0', '--base', `/preview/${id}/`];
-      } else {
-        startCmd = ['npx', 'serve', '.', '-l', '0'];
+      for (const [fileName, content] of Object.entries(project.files)) {
+        const filePath = resolveProjectFile(tmpDir, fileName);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        writeFileSmart(filePath, content);
       }
-    }
+      logLine(session, `Wrote ${Object.keys(project.files).length} project files`);
 
-    const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: frontendRoot, env, shell: true });
-    session.process = dev;
+      const detected = detectFrontendRoot(tmpDir);
+      if (!detected) {
+        throw new Error('Root package.json uses concurrently, but no frontend Vite directory was found');
+      }
+      const frontendRoot = detected.directory;
+      session.outputDir = frontendRoot;
+      logLine(session, `Frontend root: ${path.relative(tmpDir, frontendRoot) || '.'} (${detected.reason})`);
 
-    let portResolved = false;
-    dev.stdout.on('data', (data) => {
-      const str = data.toString();
-      log(str);
-      if (!portResolved) {
-        const match = str.match(/http:\/\/localhost:(\d+)/);
-        if (match) {
-          const port = parseInt(match[1], 10);
-          portResolved = true;
-          waitForServerReady(port, id)
-            .then(() => {
-              session.port = port;
-              session.status = 'running';
-              log(`✅ Dev server healthy on port ${port}`);
-            })
-            .catch(err => {
-              session.status = 'error';
-              log(`❌ Dev server health check failed: ${err.message}`);
-            });
+      const viteConfig = readViteConfig(frontendRoot);
+      if (viteConfig) {
+        const original = fs.readFileSync(viteConfig.filePath, 'utf8');
+        fs.writeFileSync(viteConfig.filePath, patchViteConfig(original, id), 'utf8');
+        logLine(session, `Patched ${viteConfig.fileName} with proxy-safe base and host settings`);
+      }
+
+      const packageJson = readPackage(frontendRoot);
+      if (!packageJson) {
+        logLine(session, 'No package.json found anywhere; serving static files immediately');
+        session.status = 'running';
+        logLine(session, 'Static preview ready');
+        return;
+      }
+
+      logLine(session, 'Starting npm install');
+      const env = {
+        ...process.env,
+        NODE_ENV: 'development',
+        npm_config_cache: NPM_CACHE
+      };
+      const install = spawnCommand(session, 'npm', [
+        'install', '--prefer-offline', '--no-audit', '--no-fund'
+      ], { cwd: frontendRoot, env });
+      session.installProcess = install;
+
+      const handleInstallOutput = (data) => logLine(session, data.toString());
+      install.stdout.on('data', handleInstallOutput);
+      install.stderr.on('data', handleInstallOutput);
+      install.on('error', (error) => setSessionError(session, `npm install failed to start: ${error.message}`));
+      install.on('close', (code) => {
+        session.installProcess = null;
+        if (session.status === 'error') return;
+        if (code !== 0) {
+          setSessionError(session, `npm install failed with code ${code}`);
+          return;
         }
-      }
-    });
-    dev.stderr.on('data', d => log(d.toString()));
-    dev.on('error', (err) => {
-      log(`Dev server error: ${err.message}`);
-      session.status = 'error';
-    });
-    dev.on('close', () => {
-      if (!portResolved || session.status !== 'running') session.status = 'error';
-      else session.status = 'stopped';
-    });
+
+        logLine(session, 'Install complete');
+        const viteProject = isViteProject(frontendRoot, packageJson);
+        let command;
+        let args;
+        if (viteProject) {
+          command = 'npx';
+          args = [
+            'vite',
+            '--host', '0.0.0.0',
+            '--port', '0',
+            '--base', `/preview/${id}/`
+          ];
+          logLine(session, 'Vite frontend detected; root backend scripts are ignored');
+        } else if (packageJson.scripts?.dev && !isConcurrentlyScript(packageJson.scripts.dev)) {
+          command = 'npm';
+          args = ['run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
+        } else {
+          setSessionError(session, 'No safe frontend dev command found');
+          return;
+        }
+
+        logLine(session, `Starting frontend dev server: ${command} ${args.join(' ')}`);
+        const dev = spawnCommand(session, command, args, { cwd: frontendRoot, env });
+        let portResolved = false;
+        let healthStarted = false;
+
+        const handleDevOutput = (data) => {
+          const output = data.toString();
+          logLine(session, output);
+          if (portResolved) return;
+          const port = detectPort(output);
+          if (!port) return;
+          portResolved = true;
+          session.port = port;
+          logLine(session, `Detected frontend port ${port}`);
+          if (healthStarted) return;
+          healthStarted = true;
+          waitForServerReady(port, id)
+            .then((healthyPath) => {
+              session.status = 'running';
+              session.lastUsed = Date.now();
+              logLine(session, `Health check passed at ${healthyPath}`);
+              logLine(session, `Preview running on port ${port}`);
+            })
+            .catch((error) => setSessionError(session, `Health check failed: ${error.message}`));
+        };
+
+        dev.stdout.on('data', handleDevOutput);
+        dev.stderr.on('data', handleDevOutput);
+        dev.on('error', (error) => setSessionError(session, `Dev server failed to start: ${error.message}`));
+        dev.on('close', (code, signal) => {
+          logLine(session, `Dev server exited with code ${code}${signal ? ` (${signal})` : ''}`);
+          if (session.status === 'starting') {
+            setSessionError(session, 'Dev server exited before becoming healthy');
+          } else if (session.status === 'running') {
+            session.status = 'stopped';
+          }
+        });
+      });
+    } catch (error) {
+      setSessionError(session, error);
+    }
   });
+
+  return session;
 }
 
-setInterval(() => {
-  const now = Date.now();
-  sessions.forEach((s, id) => {
-    if (s.status === 'running' && s.process && now - s.lastUsed > 10 * 60 * 1000) {
-      s.process.kill();
-      sessions.delete(id);
-      projects.delete(id);
-      fs.rmSync(path.join(__dirname, 'builds', id), { recursive: true, force: true });
+function previewPath(id, originalUrl) {
+  const prefix = `/preview/${id}`;
+  if (!originalUrl.startsWith(prefix)) return originalUrl || '/';
+  const suffix = originalUrl.slice(prefix.length);
+  if (!suffix) return `${prefix}/`;
+  if (suffix.startsWith('?')) return `${prefix}/${suffix}`;
+  return originalUrl;
+}
+
+app.post('/api/projects', (req, res) => {
+  const { files } = req.body || {};
+  if (!files || typeof files !== 'object' || Array.isArray(files)) {
+    return res.status(400).json({ error: 'Missing files object' });
+  }
+  if (Object.keys(files).length === 0) {
+    return res.status(400).json({ error: 'Files object cannot be empty' });
+  }
+
+  try {
+    for (const [fileName, content] of Object.entries(files)) {
+      if (!fileName || typeof content !== 'string') {
+        throw new Error(`Invalid file entry: ${fileName}`);
+      }
     }
-  });
-}, 5 * 60 * 1000);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  const id = uuidv4();
+  projects.set(id, { files: { ...files }, createdAt: Date.now() });
+  return res.status(201).json({ id });
+});
 
 app.get('/api/projects/:id/preview', (req, res) => {
-  const id = req.params.id;
+  const { id } = req.params;
   if (!projects.has(id)) return res.status(404).json({ error: 'Project not found' });
-  const s = sessions.get(id);
-  if (s?.status === 'running') {
-    s.lastUsed = Date.now();
-    return res.json({ url: `/preview/${id}`, status: 'ready' });
+  const session = startDevServer(id);
+  if (session.status === 'running') {
+    session.lastUsed = Date.now();
+    return res.json({ url: `/preview/${id}/`, status: 'ready' });
   }
-  startDevServer(id);
-  res.json({ url: `/preview/${id}`, status: 'starting' });
+  return res.status(202).json({ url: `/preview/${id}/`, status: session.status });
 });
 
 app.get('/api/projects/:id/logs', (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s) return res.json({ logs: [], status: 'idle' });
-  res.json({ logs: s.logs, status: s.status, url: `/preview/${req.params.id}` });
+  const { id } = req.params;
+  if (!projects.has(id)) return res.status(404).json({ error: 'Project not found' });
+  const session = sessions.get(id);
+  return res.json({
+    logs: session?.logs || [],
+    status: session?.status || 'idle',
+    url: `/preview/${id}/`
+  });
 });
 
 app.use('/preview/:id', (req, res, next) => {
-  const id = req.params.id;
+  const { id } = req.params;
   const session = sessions.get(id);
+  if (!session || session.status !== 'running') return next();
+  session.lastUsed = Date.now();
 
-  if (session && session.status === 'running' && !session.port && session.outputDir) {
-    return express.static(session.outputDir)(req, res, next);
-  }
-
-  if (session && session.status === 'running' && session.port) {
+  if (session.port) {
     const proxyReq = http.request({
       hostname: '127.0.0.1',
       port: session.port,
-      path: req.url,
+      path: previewPath(id, req.originalUrl),
       method: req.method,
       headers: { ...req.headers, host: `localhost:${session.port}` }
     }, (proxyRes) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
     });
-    proxyReq.on('error', () => res.status(502).send('Preview server unreachable'));
-    return req.pipe(proxyReq);
+    proxyReq.setTimeout(30000, () => proxyReq.destroy(new Error('Preview proxy timeout')));
+    proxyReq.on('error', (error) => {
+      if (!res.headersSent) res.status(502).send(`Preview server unreachable: ${error.message}`);
+      else res.end();
+    });
+    req.pipe(proxyReq);
+    return;
   }
 
-  next();
+  const staticHandler = express.static(session.outputDir, { index: 'index.html' });
+  staticHandler(req, res, () => {
+    if (req.method === 'GET' && !res.headersSent) {
+      const indexPath = path.join(session.outputDir, 'index.html');
+      if (fs.existsSync(indexPath)) return res.sendFile(indexPath);
+    }
+    return next();
+  });
 });
 
 app.get('/preview/:id', (req, res, next) => {
-  const id = req.params.id;
+  const { id } = req.params;
   const session = sessions.get(id);
   if (session?.status === 'running') return next();
-  if (projects.has(id)) {
-    if (!session || session.status !== 'starting') startDevServer(id);
-    return res.send(`<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Loading...</title>
-<style>body{margin:0;background:#ffffff;color:#111;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}.spinner{width:48px;height:48px;border:5px solid #e5e7eb;border-top:5px solid #3b82f6;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:16px}@keyframes spin{to{transform:rotate(360deg)}}h2{margin-bottom:8px;font-weight:600}p{color:#6b7280}</style>
-<script>const id='${id}';setInterval(async()=>{try{const r=await fetch('/api/projects/'+id+'/logs');const d=await r.json();if(d.status==='running')window.location.reload()}catch(e){}},1500)</script>
-</head><body><div class="spinner"></div><h2>Setting up your preview…</h2><p>This will only take a few seconds</p></body></html>`);
+  if (!projects.has(id)) return res.status(404).send('Preview not found');
+
+  if (!session || session.status === 'stopped' || session.status === 'error') {
+    startDevServer(id);
   }
-  next();
+  return res.send(`<!doctype html>
+<html><head><meta charset="UTF-8"><title>Loading preview</title>
+<style>body{margin:0;background:#fff;color:#111;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}.spinner{width:48px;height:48px;border:5px solid #e5e7eb;border-top:5px solid #3b82f6;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px}@keyframes spin{to{transform:rotate(360deg)}}h2{margin:0 0 8px;font-weight:600}p{color:#6b7280}</style>
+<script>const id=${JSON.stringify(id)};setInterval(async()=>{try{const response=await fetch('/api/projects/'+id+'/logs');const data=await response.json();if(data.status==='running')window.location.reload();if(data.status==='error')document.body.innerHTML='<h2>Preview failed</h2><p>Check the build logs for details.</p>'}catch(e){}},1500)</script>
+</head><body><div class="spinner"></div><h2>Setting up your preview…</h2><p>Build progress is available in the logs.</p></body></html>`);
 });
 
 const clientDist = path.join(__dirname, 'client', 'dist');
-app.use(express.static(clientDist));
-app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+} else {
+  app.get('*', (req, res) => res.status(404).send('Preview engine client has not been built'));
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('🚀 Engine running on port ' + PORT));
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions.entries()) {
+    if (session.status === 'running' && now - session.lastUsed > 10 * 60 * 1000) {
+      if (session.process) session.process.kill();
+      if (session.installProcess) session.installProcess.kill();
+      sessions.delete(id);
+      projects.delete(id);
+      fs.rmSync(path.join(BUILDS_DIR, id), { recursive: true, force: true });
+      logServer(`Cleaned up inactive preview ${id}`);
+    }
+  }
+}, 5 * 60 * 1000);
+cleanupTimer.unref();
+
+app.listen(PORT, () => logServer(`Engine running on port ${PORT}`));
