@@ -168,96 +168,6 @@ function detectFrontendRoot(baseDir) {
   return { directory: baseDir, reason: 'project root fallback' };
 }
 
-function findMatchingBrace(content, openBrace) {
-  let depth = 0;
-  let quote = null;
-  let escaped = false;
-  let lineComment = false;
-  let blockComment = false;
-
-  for (let index = openBrace; index < content.length; index += 1) {
-    const character = content[index];
-    const next = content[index + 1];
-
-    if (lineComment) {
-      if (character === '\n') lineComment = false;
-      continue;
-    }
-    if (blockComment) {
-      if (character === '*' && next === '/') {
-        blockComment = false;
-        index += 1;
-      }
-      continue;
-    }
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-      } else if (character === '\\') {
-        escaped = true;
-      } else if (character === quote) {
-        quote = null;
-      }
-      continue;
-    }
-    if (character === '/' && next === '/') {
-      lineComment = true;
-      index += 1;
-      continue;
-    }
-    if (character === '/' && next === '*') {
-      blockComment = true;
-      index += 1;
-      continue;
-    }
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-    if (character === '{') {
-      depth += 1;
-    } else if (character === '}') {
-      depth -= 1;
-      if (depth === 0) return index;
-    }
-  }
-
-  return -1;
-}
-
-function patchViteConfig(content, id) {
-  if (typeof content !== 'string') {
-    throw new Error('Vite config must be text');
-  }
-
-  const defineIndex = content.indexOf('defineConfig(');
-  if (defineIndex === -1) {
-    return content;
-  }
-
-  const openBrace = content.indexOf('{', defineIndex);
-  if (openBrace === -1) {
-    return content;
-  }
-
-  const closeBrace = findMatchingBrace(content, openBrace);
-  if (closeBrace === -1) {
-    throw new Error('Could not find the end of the Vite config object');
-  }
-
-  const injectedConfig = [
-    '',
-    `  base: '/preview/${id}/',`,
-    `  server: { allowedHosts: true, host: '0.0.0.0' },`,
-    ''
-  ].join('\n');
-
-  // Insert at the end of the config object so existing base/server fields
-  // cannot override the proxy-safe values. This intentionally uses indexes,
-  // not a regex that could corrupt nested JavaScript.
-  return content.slice(0, closeBrace) + injectedConfig + content.slice(closeBrace);
-}
-
 function readViteConfig(directory) {
   for (const fileName of ['vite.config.js', 'vite.config.ts']) {
     const filePath = path.join(directory, fileName);
@@ -381,13 +291,6 @@ function startDevServer(id) {
       const frontendRoot = detected.directory;
       session.outputDir = frontendRoot;
       logLine(session, `Frontend root: ${path.relative(tmpDir, frontendRoot) || '.'} (${detected.reason})`);
-
-      const viteConfig = readViteConfig(frontendRoot);
-      if (viteConfig) {
-        const original = fs.readFileSync(viteConfig.filePath, 'utf8');
-        fs.writeFileSync(viteConfig.filePath, patchViteConfig(original, id), 'utf8');
-        logLine(session, `Patched ${viteConfig.fileName} with proxy-safe base and host settings`);
-      }
 
       const packageJson = readPackage(frontendRoot);
       if (!packageJson) {
