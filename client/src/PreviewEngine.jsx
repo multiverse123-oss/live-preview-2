@@ -4,6 +4,7 @@ export default function PreviewEngine({ projectId }) {
   const [status, setStatus] = useState('idle');     // idle | building | running | error
   const [logs, setLogs] = useState([]);
   const [previewUrl, setPreviewUrl] = useState(null);
+  const [frameError, setFrameError] = useState(null);
   const [showLogs, setShowLogs] = useState(false);
   const logEndRef = useRef(null);
   const iframeRef = useRef(null);
@@ -13,27 +14,38 @@ export default function PreviewEngine({ projectId }) {
     setStatus('building');
     setLogs([]);
     setPreviewUrl(null);
+    setFrameError(null);
 
-    fetch(`/api/projects/${projectId}/preview`)
-      .then(r => r.json())
+    const loadJson = async (url) => {
+      const response = await fetch(url);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || `Request failed (${response.status})`);
+      }
+      return data;
+    };
+
+    loadJson(`/api/projects/${projectId}/preview`)
       .then(data => {
         if (data.status === 'ready') {
-          setPreviewUrl(`/preview/${projectId}`);
+          setPreviewUrl(`/preview/${projectId}/`);
           setStatus('running');
         } else {
           const poll = setInterval(() => {
-            fetch(`/api/projects/${projectId}/logs`)
-              .then(r => r.json())
+            loadJson(`/api/projects/${projectId}/logs`)
               .then(build => {
                 setLogs(build.logs);
                 if (build.status === 'running') {
-                  setPreviewUrl(`/preview/${projectId}`);
+                  setPreviewUrl(`/preview/${projectId}/`);
                   setStatus('running');
                   clearInterval(poll);
                 } else if (build.status === 'error') {
                   setStatus('error');
                   clearInterval(poll);
                 }
+              })
+              .catch(error => {
+                setLogs(current => [...current, `Preview status unavailable: ${error.message}`]);
               });
           }, 1500);
           return () => clearInterval(poll);
@@ -72,13 +84,32 @@ export default function PreviewEngine({ projectId }) {
           <p className="loading-msg">Building your app…</p>
         </div>
       ) : previewUrl ? (
-        <iframe
-          ref={iframeRef}
-          src={previewUrl}
-          sandbox="allow-scripts allow-same-origin"
-          title="live preview"
-          className="preview-iframe"
-        />
+        <>
+          <iframe
+            ref={iframeRef}
+            src={previewUrl}
+            sandbox="allow-scripts allow-same-origin"
+            title="live preview"
+            className="preview-iframe"
+            onLoad={() => setFrameError(null)}
+            onError={() => setFrameError('The preview frame did not load.')}
+          />
+          {frameError && (
+            <div className="preview-frame-fallback" role="alert">
+              <strong>Preview is still available.</strong>
+              <span>{frameError}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setFrameError(null);
+                  setPreviewUrl(`/preview/${projectId}/?retry=${Date.now()}`);
+                }}
+              >
+                Retry preview
+              </button>
+            </div>
+          )}
+        </>
       ) : (
         <div className="loading-view">
           <p>Waiting for preview…</p>

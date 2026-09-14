@@ -18,6 +18,14 @@ const BINARY_EXTS = new Set([
   '.woff', '.woff2', '.ttf', '.ico', '.svg', '.pdf'
 ]);
 const HEALTH_CHECK_TIMEOUT_MS = 1000 * 1000;
+const AI_STUDIO_IMPORTS = {
+  react: 'https://esm.sh/react@18',
+  'react-dom': 'https://esm.sh/react-dom@18',
+  'react-dom/client': 'https://esm.sh/react-dom@18/client',
+  'react/jsx-runtime': 'https://esm.sh/react@18/jsx-runtime',
+  'react-router-dom': 'https://esm.sh/react-router-dom@6',
+  'react-router-dom/': 'https://esm.sh/react-router-dom@6/'
+};
 
 const corsOptions = {
   origin: process.env.CORS_ORIGIN || '*',
@@ -32,12 +40,6 @@ fs.mkdirSync(BUILDS_DIR, { recursive: true });
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
-
-app.use((req, res, next) => {
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-  next();
-});
 
 function timestamp() {
   return new Date().toISOString();
@@ -113,6 +115,33 @@ function hasAnyPackageJson(directory) {
   return false;
 }
 
+function listProjectFiles(directory, extensions = null, result = []) {
+  if (!fs.existsSync(directory)) return result;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.git' || entry.name.startsWith('.')) {
+      continue;
+    }
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      listProjectFiles(entryPath, extensions, result);
+      continue;
+    }
+    if (!extensions || extensions.has(path.extname(entry.name).toLowerCase())) {
+      result.push(entryPath);
+    }
+  }
+  return result;
+}
+
+function isAiStudioProject(directory) {
+  return !hasAnyPackageJson(directory) &&
+    listProjectFiles(directory, new Set(['.ts', '.tsx'])).length > 0;
+}
+
+function aiStudioSourceFiles(directory) {
+  return listProjectFiles(directory, new Set(['.ts', '.tsx']));
+}
+
 function isConcurrentlyScript(script) {
   return typeof script === 'string' && script.toLowerCase().includes('concurrently');
 }
@@ -186,6 +215,296 @@ function isViteProject(directory, packageJson) {
     ...(packageJson?.devDependencies || {})
   };
   return Boolean(dependencies.vite) || /\bvite\b/i.test(scripts.dev || '');
+}
+
+function loadEsbuild() {
+  const candidates = [
+    'esbuild',
+    path.join(__dirname, 'client', 'node_modules', 'esbuild')
+  ];
+  for (const candidate of candidates) {
+    try {
+      return require(candidate);
+    } catch {
+      // Try the next location. The client install owns the transitive Vite dependency.
+    }
+  }
+  throw new Error('AI Studio runtime requires esbuild; run the engine build first');
+}
+
+function normalizeProjectPath(filePath) {
+  return filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function existingAiFile(baseDir, requestPath, extensions = []) {
+  const cleanPath = decodeURIComponent(String(requestPath || '').split('?')[0])
+    .replace(/^\/+/, '');
+  if (!cleanPath || cleanPath.includes('\0')) return null;
+
+  const candidates = [cleanPath];
+  if (!path.extname(cleanPath)) {
+    candidates.push(...extensions.map((extension) => `${cleanPath}${extension}`));
+    candidates.push(...extensions.map((extension) => path.join(cleanPath, `index${extension}`)));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const filePath = resolveProjectFile(baseDir, candidate);
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        return {
+          filePath,
+          relativePath: normalizeProjectPath(path.relative(baseDir, filePath))
+        };
+      }
+    } catch {
+      // Invalid or escaping candidates are simply not project files.
+    }
+  }
+  return null;
+}
+
+function resolveAiImport(baseDir, currentFile, specifier) {
+  if (!specifier.startsWith('./') && !specifier.startsWith('../')) return specifier;
+
+  const [specifierPath, query = ''] = specifier.split('?', 2);
+  const currentDirectory = path.dirname(currentFile);
+  const requested = normalizeProjectPath(path.normalize(path.join(currentDirectory, specifierPath)));
+  const candidates = [requested];
+  if (!path.extname(requested)) {
+    candidates.push(`${requested}.tsx`, `${requested}.ts`, `${requested}.jsx`, `${requested}.js`);
+    candidates.push(
+      `${requested}/index.tsx`,
+      `${requested}/index.ts`,
+      `${requested}/index.jsx`,
+      `${requested}/index.js`,
+      `${requested}.css`
+    );
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const filePath = resolveProjectFile(baseDir, candidate);
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) continue;
+      const relativePath = normalizeProjectPath(path.relative(baseDir, filePath));
+      const extension = path.extname(filePath).toLowerCase();
+      const modulePath = normalizeProjectPath(path.relative(currentDirectory, relativePath));
+      const browserPath = modulePath.startsWith('.') ? modulePath : `./${modulePath}`;
+      if (extension === '.css') {
+        return `${browserPath}?__ai_css=1`;
+      }
+      return query ? `${browserPath}?${query}` : browserPath;
+    } catch {
+      // Leave unresolved imports untouched so the browser can report the original module.
+    }
+  }
+  return specifier;
+}
+
+function rewriteAiImports(code, baseDir, currentFile) {
+  const importPattern = /(\b(?:from\s*|import\s*(?:\(\s*)?))(['"])(\.{1,2}\/[^'"]+)\2/g;
+  return code.replace(importPattern, (match, prefix, quote, specifier) => {
+    const resolved = resolveAiImport(baseDir, currentFile, specifier);
+    return `${prefix}${quote}${resolved}${quote}`;
+  });
+}
+
+async function transpileAiModule(baseDir, filePath) {
+  const esbuild = loadEsbuild();
+  const source = fs.readFileSync(filePath, 'utf8');
+  const extension = path.extname(filePath).toLowerCase();
+  const loader = extension === '.ts' ? 'ts' : 'tsx';
+  const result = await esbuild.transform(source, {
+    loader,
+    format: 'esm',
+    target: 'es2020',
+    sourcemap: 'inline',
+    sourcefile: normalizeProjectPath(path.relative(baseDir, filePath))
+  });
+  return rewriteAiImports(
+    result.code,
+    baseDir,
+    normalizeProjectPath(path.relative(baseDir, filePath))
+  );
+}
+
+function aiCssModule(source) {
+  return `const css = ${JSON.stringify(source)};
+const style = document.createElement('style');
+style.setAttribute('data-ai-studio-css', 'true');
+style.textContent = css;
+document.head.appendChild(style);
+export default {};
+`;
+}
+
+function aiStudioBody(baseDir) {
+  const indexPath = path.join(baseDir, 'index.html');
+  if (!fs.existsSync(indexPath)) return '<div id="root"></div>';
+  const source = fs.readFileSync(indexPath, 'utf8');
+  const bodyMatch = source.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const body = bodyMatch ? bodyMatch[1] : source;
+  const withoutModuleEntries = body.replace(
+    /<script\b[^>]*type=["']module["'][^>]*src=["'][^"']+\.(?:tsx?|jsx?)["'][^>]*><\/script>/gi,
+    ''
+  );
+  return withoutModuleEntries.trim() || '<div id="root"></div>';
+}
+
+function aiStudioEntry(baseDir) {
+  let metadata = {};
+  const metadataPath = path.join(baseDir, 'metadata.json');
+  if (fs.existsSync(metadataPath)) {
+    try {
+      metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    } catch {
+      metadata = {};
+    }
+  }
+
+  const candidates = [
+    typeof metadata.entry === 'string' ? metadata.entry : null,
+    'index.tsx',
+    'index.ts',
+    'App.tsx',
+    'App.ts'
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    const file = existingAiFile(baseDir, candidate, ['.tsx', '.ts']);
+    if (file) return file.relativePath;
+  }
+  return candidates[0] || 'index.tsx';
+}
+
+function aiStudioShell(id, baseDir) {
+  const prefix = `/preview/${id}/`;
+  const importMap = JSON.stringify({ imports: AI_STUDIO_IMPORTS }, null, 2);
+  const body = aiStudioBody(baseDir).replace(/<\/script/gi, '<\\/script');
+  const loader = `
+<script type="module">
+const previewBase = ${JSON.stringify(prefix)};
+const defaultEntry = ${JSON.stringify(aiStudioEntry(baseDir))};
+const normalizeEntry = (value) => {
+  if (typeof value !== 'string') return defaultEntry;
+  const candidate = value.trim().replace(/^\/+/, '');
+  if (!candidate || candidate.split('/').includes('..') || candidate.includes('\\0')) {
+    return defaultEntry;
+  }
+  return candidate;
+};
+
+async function readEntry() {
+  try {
+    const response = await fetch(previewBase + 'metadata.json', { cache: 'no-store' });
+    if (!response.ok) return defaultEntry;
+    const metadata = await response.json();
+    return normalizeEntry(metadata.entry);
+  } catch {
+    return defaultEntry;
+  }
+}
+
+async function importEntry(entry) {
+  const candidates = [entry, 'index.tsx', 'index.ts', 'App.tsx', 'App.ts']
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      return await import(new URL(candidate, window.location.href).href);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('No AI Studio entry module found');
+}
+
+async function start() {
+  const root = document.getElementById('root') || document.body;
+  try {
+    const module = await importEntry(await readEntry());
+    if (
+      root.id === 'root' &&
+      root.children.length === 0 &&
+      !root.textContent.trim() &&
+      typeof module.default === 'function'
+    ) {
+      const React = await import('react');
+      const ReactDOM = await import('react-dom/client');
+      ReactDOM.createRoot(root).render(React.createElement(module.default));
+    }
+    document.documentElement.dataset.aiStudioReady = 'true';
+  } catch (error) {
+    console.error('AI Studio preview module failed', error);
+    root.innerHTML = '<div style="padding:24px;font-family:system-ui,sans-serif;color:#334155"><h2>Preview could not load this module</h2><p>Try refreshing the preview after checking the build logs.</p></div>';
+  }
+}
+
+start();
+</script>`;
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Studio Preview</title>
+  <script type="importmap">${importMap}</script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>${body}${loader}</body>
+</html>`;
+}
+
+async function serveAiStudioRequest(id, session, req, res, next) {
+  const baseDir = session.outputDir;
+  const prefix = `/preview/${id}`;
+  const requested = req.originalUrl.split('?')[0].slice(prefix.length).replace(/^\/+/, '');
+
+  if (!requested || requested === 'index.html') {
+    res.type('html').send(aiStudioShell(id, baseDir));
+    return;
+  }
+
+  const url = new URL(req.originalUrl, 'http://preview.local');
+  const aiFile = existingAiFile(baseDir, requested, ['.tsx', '.ts']);
+  if (!aiFile) {
+    if (req.method === 'GET') res.status(404).send('AI Studio project file not found');
+    else next();
+    return;
+  }
+
+  try {
+    const extension = path.extname(aiFile.filePath).toLowerCase();
+    if ((extension === '.ts' || extension === '.tsx') && req.method === 'GET') {
+      const code = await transpileAiModule(baseDir, aiFile.filePath);
+      res.type('application/javascript').send(code);
+      return;
+    }
+    if (extension === '.css' && url.searchParams.get('__ai_css') === '1') {
+      res.type('application/javascript').send(
+        aiCssModule(fs.readFileSync(aiFile.filePath, 'utf8'))
+      );
+      return;
+    }
+    if (req.method === 'GET') {
+      res.sendFile(aiFile.filePath);
+      return;
+    }
+    next();
+  } catch (error) {
+    logLine(session, `AI Studio transform failed for ${aiFile.relativePath}: ${error.message}`);
+    res.status(500).type('text').send('AI Studio module could not be transformed');
+  }
+}
+
+function sanitizePreviewHeaders(headers) {
+  const sanitized = { ...headers };
+  for (const header of [
+    'cross-origin-embedder-policy',
+    'cross-origin-opener-policy',
+    'cross-origin-resource-policy'
+  ]) {
+    delete sanitized[header];
+  }
+  return sanitized;
 }
 
 function detectPort(output) {
@@ -266,6 +585,7 @@ function startDevServer(id) {
     process: null,
     installProcess: null,
     outputDir: null,
+    runtime: null,
     lastUsed: Date.now()
   };
   sessions.set(id, session);
@@ -283,6 +603,19 @@ function startDevServer(id) {
         writeFileSmart(filePath, content);
       }
       logLine(session, `Wrote ${Object.keys(project.files).length} project files`);
+
+      if (isAiStudioProject(tmpDir)) {
+        const sourceFiles = aiStudioSourceFiles(tmpDir);
+        session.outputDir = tmpDir;
+        session.runtime = 'ai-studio';
+        logLine(session, 'AI Studio project detected (no package.json, contains TSX/TS)');
+        logLine(session, `Transpiling ${sourceFiles.length} TS/TSX files on demand`);
+        logLine(session, 'Serving runtime HTML shell');
+        logLine(session, `Entry: ${aiStudioEntry(tmpDir)}`);
+        session.status = 'running';
+        logLine(session, '✅ Dev server ready (AI Studio runtime)');
+        return;
+      }
 
       const detected = detectFrontendRoot(tmpDir);
       if (!detected) {
@@ -451,6 +784,16 @@ app.use('/preview/:id', (req, res, next) => {
   if (!session || session.status !== 'running') return next();
   session.lastUsed = Date.now();
 
+  if (session.runtime === 'ai-studio') {
+    serveAiStudioRequest(id, session, req, res, next).catch((error) => {
+      logLine(session, `AI Studio request failed: ${error.message}`);
+      if (!res.headersSent) {
+        res.status(500).type('text').send('AI Studio preview request failed');
+      }
+    });
+    return;
+  }
+
   if (session.port) {
     const proxyReq = http.request({
       hostname: '127.0.0.1',
@@ -459,7 +802,7 @@ app.use('/preview/:id', (req, res, next) => {
       method: req.method,
       headers: { ...req.headers, host: `localhost:${session.port}` }
     }, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      res.writeHead(proxyRes.statusCode, sanitizePreviewHeaders(proxyRes.headers));
       proxyRes.pipe(res);
     });
     proxyReq.setTimeout(30000, () => proxyReq.destroy(new Error('Preview proxy timeout')));
