@@ -379,13 +379,40 @@ function aiStudioShell(id, baseDir) {
   const prefix = `/preview/${id}/`;
   const importMap = JSON.stringify({ imports: AI_STUDIO_IMPORTS }, null, 2);
   const body = aiStudioBody(baseDir).replace(/<\/script/gi, '<\\/script');
+  const errorHandler = `
+<script>
+(() => {
+  const showError = (error) => {
+    const root = document.getElementById('root') || document.body;
+    const message = error && error.stack
+      ? error.stack
+      : String(error && error.message ? error.message : error);
+    console.error('AI Studio preview failed', error);
+    root.replaceChildren();
+
+    const panel = document.createElement('div');
+    panel.style.cssText = 'padding:24px;font-family:system-ui,sans-serif;color:#334155';
+    const heading = document.createElement('h2');
+    heading.textContent = 'AI Studio preview failed';
+    const details = document.createElement('pre');
+    details.style.cssText = 'white-space:pre-wrap;color:#b91c1c';
+    details.textContent = message;
+    panel.append(heading, details);
+    root.appendChild(panel);
+  };
+
+  window.__showAiStudioError = showError;
+  window.addEventListener('error', (event) => showError(event.error || event.message));
+  window.addEventListener('unhandledrejection', (event) => showError(event.reason));
+})();
+</script>`;
   const loader = `
 <script type="module">
 const previewBase = ${JSON.stringify(prefix)};
 const defaultEntry = ${JSON.stringify(aiStudioEntry(baseDir))};
 const normalizeEntry = (value) => {
   if (typeof value !== 'string') return defaultEntry;
-  const candidate = value.trim().replace(/^\/+/, '');
+  const candidate = value.trim().replace(/^\\/+/, '');
   if (!candidate || candidate.split('/').includes('..') || candidate.includes('\\0')) {
     return defaultEntry;
   }
@@ -434,7 +461,11 @@ async function start() {
     document.documentElement.dataset.aiStudioReady = 'true';
   } catch (error) {
     console.error('AI Studio preview module failed', error);
-    root.innerHTML = '<div style="padding:24px;font-family:system-ui,sans-serif;color:#334155"><h2>Preview could not load this module</h2><p>Try refreshing the preview after checking the build logs.</p></div>';
+    if (typeof window.__showAiStudioError === 'function') {
+      window.__showAiStudioError(error);
+    } else {
+      root.textContent = String(error && error.stack ? error.stack : error);
+    }
   }
 }
 
@@ -449,7 +480,7 @@ start();
   <script type="importmap">${importMap}</script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
-<body>${body}${loader}</body>
+<body>${body}${errorHandler}${loader}</body>
 </html>`;
 }
 
