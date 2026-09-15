@@ -26,6 +26,21 @@ const AI_STUDIO_IMPORTS = {
   'react-router-dom': 'https://esm.sh/react-router-dom@6',
   'react-router-dom/': 'https://esm.sh/react-router-dom@6/'
 };
+const AI_SOURCE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js'];
+const AI_ENTRY_CANDIDATES = [
+  'index.tsx',
+  'index.ts',
+  'index.jsx',
+  'index.js',
+  'App.tsx',
+  'App.ts',
+  'App.jsx',
+  'App.js',
+  'main.tsx',
+  'main.ts',
+  'main.jsx',
+  'main.js'
+];
 
 const corsOptions = {
   origin: process.env.CORS_ORIGIN || '*',
@@ -236,18 +251,31 @@ function normalizeProjectPath(filePath) {
   return filePath.replace(/\\/g, '/').replace(/^\/+/, '');
 }
 
-function existingAiFile(baseDir, requestPath, extensions = []) {
+function existingAiFile(baseDir, requestPath, extensions = AI_SOURCE_EXTENSIONS) {
   const cleanPath = decodeURIComponent(String(requestPath || '').split('?')[0])
     .replace(/^\/+/, '');
   if (!cleanPath || cleanPath.includes('\0')) return null;
 
-  const candidates = [cleanPath];
-  if (!path.extname(cleanPath)) {
-    candidates.push(...extensions.map((extension) => `${cleanPath}${extension}`));
-    candidates.push(...extensions.map((extension) => path.join(cleanPath, `index${extension}`)));
+  const extension = path.extname(cleanPath).toLowerCase();
+  const candidates = [];
+  if (!extension) {
+    candidates.push(
+      ...extensions.map((candidateExtension) => `${cleanPath}${candidateExtension}`),
+      ...extensions.map((candidateExtension) => path.join(cleanPath, `index${candidateExtension}`))
+    );
+  } else if (extensions.includes(extension)) {
+    const stem = cleanPath.slice(0, -extension.length);
+    candidates.push(
+      cleanPath,
+      ...extensions
+        .filter((candidateExtension) => candidateExtension !== extension)
+        .map((candidateExtension) => `${stem}${candidateExtension}`)
+    );
+  } else {
+    candidates.push(cleanPath);
   }
 
-  for (const candidate of candidates) {
+  for (const candidate of [...new Set(candidates)]) {
     try {
       const filePath = resolveProjectFile(baseDir, candidate);
       if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
@@ -269,62 +297,64 @@ function resolveAiImport(baseDir, currentFile, specifier) {
   const [specifierPath, query = ''] = specifier.split('?', 2);
   const currentDirectory = path.dirname(currentFile);
   const requested = normalizeProjectPath(path.normalize(path.join(currentDirectory, specifierPath)));
-  const candidates = [requested];
-  if (!path.extname(requested)) {
-    candidates.push(`${requested}.tsx`, `${requested}.ts`, `${requested}.jsx`, `${requested}.js`);
-    candidates.push(
-      `${requested}/index.tsx`,
-      `${requested}/index.ts`,
-      `${requested}/index.jsx`,
-      `${requested}/index.js`,
-      `${requested}.css`
-    );
+  const file = existingAiFile(baseDir, requested, AI_SOURCE_EXTENSIONS);
+  if (file) {
+    const extension = path.extname(file.filePath).toLowerCase();
+    const modulePath = normalizeProjectPath(path.relative(currentDirectory, file.relativePath));
+    const browserPath = modulePath.startsWith('.') ? modulePath : `./${modulePath}`;
+    if (extension === '.css') {
+      return `${browserPath}?__ai_css=1`;
+    }
+    return query ? `${browserPath}?${query}` : browserPath;
   }
 
-  for (const candidate of candidates) {
-    try {
-      const filePath = resolveProjectFile(baseDir, candidate);
-      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) continue;
-      const relativePath = normalizeProjectPath(path.relative(baseDir, filePath));
-      const extension = path.extname(filePath).toLowerCase();
-      const modulePath = normalizeProjectPath(path.relative(currentDirectory, relativePath));
-      const browserPath = modulePath.startsWith('.') ? modulePath : `./${modulePath}`;
-      if (extension === '.css') {
-        return `${browserPath}?__ai_css=1`;
-      }
-      return query ? `${browserPath}?${query}` : browserPath;
-    } catch {
-      // Leave unresolved imports untouched so the browser can report the original module.
-    }
+  const cssFile = existingAiFile(baseDir, requested, ['.css']);
+  if (cssFile) {
+    const modulePath = normalizeProjectPath(path.relative(currentDirectory, cssFile.relativePath));
+    const browserPath = modulePath.startsWith('.') ? modulePath : `./${modulePath}`;
+    return `${browserPath}?__ai_css=1`;
   }
+
   return specifier;
 }
 
-function rewriteAiImports(code, baseDir, currentFile) {
+function rewriteAiImports(code, baseDir, currentFile, logger = null) {
   const importPattern = /(\b(?:from\s*|import\s*(?:\(\s*)?))(['"])(\.{1,2}\/[^'"]+)\2/g;
   return code.replace(importPattern, (match, prefix, quote, specifier) => {
     const resolved = resolveAiImport(baseDir, currentFile, specifier);
+    if (resolved !== specifier) {
+      logger?.(`Resolved import ${specifier} -> ${resolved}`);
+    }
     return `${prefix}${quote}${resolved}${quote}`;
   });
 }
 
-async function transpileAiModule(baseDir, filePath) {
-  const esbuild = loadEsbuild();
-  const source = fs.readFileSync(filePath, 'utf8');
-  const extension = path.extname(filePath).toLowerCase();
-  const loader = extension === '.ts' ? 'ts' : 'tsx';
-  const result = await esbuild.transform(source, {
-    loader,
-    format: 'esm',
-    target: 'es2020',
-    sourcemap: 'inline',
-    sourcefile: normalizeProjectPath(path.relative(baseDir, filePath))
-  });
-  return rewriteAiImports(
-    result.code,
-    baseDir,
-    normalizeProjectPath(path.relative(baseDir, filePath))
-  );
+async function transpileAiModule(baseDir, filePath, logger = null) {
+  const relativePath = normalizeProjectPath(path.relative(baseDir, filePath));
+  try {
+    const esbuild = loadEsbuild();
+    const source = fs.readFileSync(filePath, 'utf8');
+    const extension = path.extname(filePath).toLowerCase();
+    const loader = {
+      '.ts': 'ts',
+      '.tsx': 'tsx',
+      '.js': 'js',
+      '.jsx': 'jsx'
+    }[extension] || 'tsx';
+    const result = await esbuild.transform(source, {
+      loader,
+      format: 'esm',
+      target: 'es2020',
+      sourcemap: 'inline',
+      sourcefile: relativePath
+    });
+    return rewriteAiImports(result.code, baseDir, relativePath, logger);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger?.(`Transpile failed for ${relativePath}: ${message}`);
+    const readable = `Transpile error in ${relativePath}: ${message}`;
+    return `const error = new Error(${JSON.stringify(readable)}); console.error(error.message); throw error;`;
+  }
 }
 
 function aiCssModule(source) {
@@ -350,7 +380,7 @@ function aiStudioBody(baseDir) {
   return withoutModuleEntries.trim() || '<div id="root"></div>';
 }
 
-function aiStudioEntry(baseDir) {
+function aiStudioEntry(baseDir, logger = null) {
   let metadata = {};
   const metadataPath = path.join(baseDir, 'metadata.json');
   if (fs.existsSync(metadataPath)) {
@@ -363,21 +393,21 @@ function aiStudioEntry(baseDir) {
 
   const candidates = [
     typeof metadata.entry === 'string' ? metadata.entry : null,
-    'index.tsx',
-    'index.ts',
-    'App.tsx',
-    'App.ts'
+    ...AI_ENTRY_CANDIDATES
   ].filter(Boolean);
   for (const candidate of candidates) {
-    const file = existingAiFile(baseDir, candidate, ['.tsx', '.ts']);
-    if (file) return file.relativePath;
+    const file = existingAiFile(baseDir, candidate, AI_SOURCE_EXTENSIONS);
+    if (file) {
+      logger?.(`Resolved entry ${candidate} -> ${file.relativePath}`);
+      return file.relativePath;
+    }
   }
   return candidates[0] || 'index.tsx';
 }
 
-function aiStudioShell(id, baseDir) {
-  const prefix = `/preview/${id}/`;
+function aiStudioShell(baseDir, entry = aiStudioEntry(baseDir)) {
   const importMap = JSON.stringify({ imports: AI_STUDIO_IMPORTS }, null, 2);
+  const entryCandidates = [...new Set([entry, ...AI_ENTRY_CANDIDATES])];
   const body = aiStudioBody(baseDir).replace(/<\/script/gi, '<\\/script');
   const errorHandler = `
 <script>
@@ -408,33 +438,11 @@ function aiStudioShell(id, baseDir) {
 </script>`;
   const loader = `
 <script type="module">
-const previewBase = ${JSON.stringify(prefix)};
-const defaultEntry = ${JSON.stringify(aiStudioEntry(baseDir))};
-const normalizeEntry = (value) => {
-  if (typeof value !== 'string') return defaultEntry;
-  const candidate = value.trim().replace(/^\\/+/, '');
-  if (!candidate || candidate.split('/').includes('..') || candidate.includes('\\0')) {
-    return defaultEntry;
-  }
-  return candidate;
-};
+const entryCandidates = ${JSON.stringify(entryCandidates)};
 
-async function readEntry() {
-  try {
-    const response = await fetch(previewBase + 'metadata.json', { cache: 'no-store' });
-    if (!response.ok) return defaultEntry;
-    const metadata = await response.json();
-    return normalizeEntry(metadata.entry);
-  } catch {
-    return defaultEntry;
-  }
-}
-
-async function importEntry(entry) {
-  const candidates = [entry, 'index.tsx', 'index.ts', 'App.tsx', 'App.ts']
-    .filter((value, index, values) => value && values.indexOf(value) === index);
+async function importEntry() {
   let lastError;
-  for (const candidate of candidates) {
+  for (const candidate of entryCandidates) {
     try {
       return await import(new URL(candidate, window.location.href).href);
     } catch (error) {
@@ -447,7 +455,7 @@ async function importEntry(entry) {
 async function start() {
   const root = document.getElementById('root') || document.body;
   try {
-    const module = await importEntry(await readEntry());
+    const module = await importEntry();
     if (
       root.id === 'root' &&
       root.children.length === 0 &&
@@ -490,12 +498,12 @@ async function serveAiStudioRequest(id, session, req, res, next) {
   const requested = req.originalUrl.split('?')[0].slice(prefix.length).replace(/^\/+/, '');
 
   if (!requested || requested === 'index.html') {
-    res.type('html').send(aiStudioShell(id, baseDir));
+    res.type('html').send(aiStudioShell(baseDir, session.aiStudioEntry));
     return;
   }
 
   const url = new URL(req.originalUrl, 'http://preview.local');
-  const aiFile = existingAiFile(baseDir, requested, ['.tsx', '.ts']);
+  const aiFile = existingAiFile(baseDir, requested, AI_SOURCE_EXTENSIONS);
   if (!aiFile) {
     if (req.method === 'GET') res.status(404).send('AI Studio project file not found');
     else next();
@@ -504,8 +512,12 @@ async function serveAiStudioRequest(id, session, req, res, next) {
 
   try {
     const extension = path.extname(aiFile.filePath).toLowerCase();
-    if ((extension === '.ts' || extension === '.tsx') && req.method === 'GET') {
-      const code = await transpileAiModule(baseDir, aiFile.filePath);
+    if (AI_SOURCE_EXTENSIONS.includes(extension) && req.method === 'GET') {
+      const code = await transpileAiModule(
+        baseDir,
+        aiFile.filePath,
+        (message) => logLine(session, message)
+      );
       res.type('application/javascript').send(code);
       return;
     }
@@ -617,6 +629,7 @@ function startDevServer(id) {
     installProcess: null,
     outputDir: null,
     runtime: null,
+    aiStudioEntry: null,
     lastUsed: Date.now()
   };
   sessions.set(id, session);
@@ -642,7 +655,8 @@ function startDevServer(id) {
         logLine(session, 'AI Studio project detected (no package.json, contains TSX/TS)');
         logLine(session, `Transpiling ${sourceFiles.length} TS/TSX files on demand`);
         logLine(session, 'Serving runtime HTML shell');
-        logLine(session, `Entry: ${aiStudioEntry(tmpDir)}`);
+        session.aiStudioEntry = aiStudioEntry(tmpDir, (message) => logLine(session, message));
+        logLine(session, `Entry: ${session.aiStudioEntry}`);
         session.status = 'running';
         logLine(session, '✅ Dev server ready (AI Studio runtime)');
         return;
