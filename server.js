@@ -20,10 +20,10 @@ const BINARY_EXTS = new Set([
 const HEALTH_CHECK_TIMEOUT_MS = 1000 * 1000;
 const AI_STUDIO_IMPORTS = {
   react: 'https://esm.sh/react@18',
-  'react-dom': 'https://esm.sh/react-dom@18',
-  'react-dom/client': 'https://esm.sh/react-dom@18/client',
-  'react/jsx-runtime': 'https://esm.sh/react@18/jsx-runtime',
-  'react-router-dom': 'https://esm.sh/react-router-dom@6',
+  'react-dom': 'https://esm.sh/react-dom@18.3.1',
+  'react-dom/client': 'https://esm.sh/react-dom@18.3.1/client',
+  'react/jsx-runtime': 'https://esm.sh/react@18.3.1/jsx-runtime',
+  'react-router-dom': 'https://esm.sh/react-router-dom@6.22.3?external=react,react-dom',
   'react-router-dom/': 'https://esm.sh/react-router-dom@6/'
 };
 const AI_SOURCE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js'];
